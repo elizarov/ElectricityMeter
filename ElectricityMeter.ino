@@ -223,7 +223,7 @@ void makeDump(char dumpType) {
     wpRef = watts[i];
     vpRef = volts[i];
     apRef = amps[i];
-    Serial.println(dumpPLine);
+    waitPrintln(dumpPLine);
   }
   // prepare for next dump
   dump.reset(PERIODIC_DUMP_INTERVAL + random(-PERIODIC_DUMP_SKEW, PERIODIC_DUMP_SKEW));
