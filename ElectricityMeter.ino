@@ -11,18 +11,33 @@
 */
 
 // include the library code:
-#include "Wire.h"
-#include "Adafruit_LiquidCrystal.h"
-#include "SoftwareSerial.h"
-#include "FixNum.h"
-#include "BlinkLed.h"
-#include "Timeout.h"
+#include <Wire.h>
+#include <Adafruit_LiquidCrystal.h>
+#include <SoftwareSerial.h>
+#include <FixNum.h>
+#include <BlinkLed.h>
+#include <Timeout.h>
+#include <FmtRef.h>
+#include <Uptime.h>
 
 #include "crc.h"
+#include "xprint.h"
 
-const uint8_t BLINK_LED_PIN = LED_BUILTIN;
+//------- ALL TIME DEFS ------
+
+const long INITIAL_DUMP_INTERVAL = 2000;
+const long PERIODIC_DUMP_INTERVAL = 60000;
+const long PERIODIC_DUMP_SKEW = 5000;
 
 const unsigned int REGULAR_BLINK_INTERVAL = 1000; // 1 sec
+
+const unsigned long RS485_TIMEOUT = 100;
+const unsigned long RS485_DELAY = 10;
+const unsigned long UPDATE_PERIOD = 500;
+
+//------- HARDWARE ------
+
+const uint8_t BLINK_LED_PIN = LED_BUILTIN;
 
 const uint8_t RS485_RXI_PIN = 2;
 const uint8_t RS485_TXO_PIN = 3;
@@ -30,19 +45,18 @@ const uint8_t RS485_RTS_PIN = 4;
 
 const long RS485_BAUD = 9600;
 
-const unsigned long RS485_TIMEOUT = 100;
-const unsigned long RS485_DELAY = 10;
-const unsigned long UPDATE_PERIOD = 500;
+Adafruit_LiquidCrystal lcd(0);
+BlinkLed blinkLed(BLINK_LED_PIN);
+SoftwareSerial rs485(RS485_TXO_PIN, RS485_RXI_PIN);
+
+Timeout updateTimeout(0);
+
+//------- STATE ------
 
 const char STATUS_UNKNOWN = '?';
 const char STATUS_OK = '*';
 
 const uint32_t INVALID_VALUE = 0x7fffffff;
-
-Adafruit_LiquidCrystal lcd(0);
-BlinkLed blinkLed(BLINK_LED_PIN);
-SoftwareSerial rs485(RS485_TXO_PIN, RS485_RXI_PIN);
-Timeout updateTimeout(0);
 
 char status = STATUS_UNKNOWN;
 fixnum32_1 volts[4];
@@ -50,11 +64,7 @@ fixnum32_1 amps[4];
 fixnum32_1 watts[4];
 fixnum32_1 hertz;
 
-void setup() {
-  lcd.begin(20, 4);
-  rs485.begin(RS485_BAUD);
-  pinMode(RS485_RTS_PIN, OUTPUT);
-}
+//------- LCD ------
 
 inline void updateLCDSummary() {
   //              01234567890123456789
@@ -82,6 +92,8 @@ inline void updateLCD() {
   for (uint8_t i = 1; i <= 3; i++)
     updateLCDPhase(i);
 }
+
+//------- RS485 -------
 
 uint8_t sendReceiveRaw(uint8_t* req, uint8_t req_size, uint8_t* resp, uint8_t resp_size) {
   computeCRC(req, req_size - 2);
@@ -153,11 +165,93 @@ void updateValues() {
   hertz = fixnum32_2(readValue(0x40));  
 }
 
-void loop() {
+void updateState() {
   if (updateTimeout.check()) {
     updateTimeout.reset(UPDATE_PERIOD);
     updateValues();
     updateLCD();
   }
+}
+
+//------- DUMP STATE -------
+
+const char HIGHLIGHT_CHAR = '*';
+
+bool firstDump = true; 
+
+Timeout dump(INITIAL_DUMP_INTERVAL);
+char dumpSLine[] = "[E:99999 f99.9;u00000000]* ";
+char dumpPLine[] = "[Ex:99999 v999 a99.9]";
+
+char* highlightPtr = FmtRef::find(dumpSLine, HIGHLIGHT_CHAR);
+
+FmtRef wsRef(dumpSLine);
+FmtRef fsRef(dumpSLine, 'f');
+FmtRef uRef(dumpSLine, 'u');
+
+char* phasePtr = FmtRef::find(dumpPLine, 'x');
+
+FmtRef wpRef(dumpPLine);
+FmtRef vpRef(dumpPLine, 'v');
+FmtRef apRef(dumpPLine, 'a');
+
+const char DUMP_REGULAR = 0;
+const char DUMP_FIRST = HIGHLIGHT_CHAR;
+
+void makeDump(char dumpType) {
+  if (status != STATUS_OK)
+    return; // no communication with meter -- do not report
+  // format summary data
+  wsRef = watts[0];
+  fsRef = hertz;
+  uRef = uptime();
+  // format terminator char
+  if (dumpType == DUMP_REGULAR) {
+    *highlightPtr = 0;
+  } else {
+    char* ptr = highlightPtr;
+    *(ptr++) = dumpType;
+    if (dumpType != HIGHLIGHT_CHAR)
+      *(ptr++) = HIGHLIGHT_CHAR; // must end with highlight (signal) char
+    *ptr = 0; // and the very last char must be zero
+  }
+  // print summary
+  waitPrintln(dumpSLine);
+  // format at print each phase
+  for (uint8_t i = 1; i <= 3; i++) {
+    *phasePtr = i + '0';
+    wpRef = watts[i];
+    vpRef = volts[i];
+    apRef = amps[i];
+    Serial.println(dumpPLine);
+  }
+  // prepare for next dump
+  dump.reset(PERIODIC_DUMP_INTERVAL + random(-PERIODIC_DUMP_SKEW, PERIODIC_DUMP_SKEW));
+  firstDump = false;
+}
+
+inline void dumpState() {
+  if (dump.check()) {
+    if (firstDump)
+      makeDump(DUMP_FIRST);
+    else 
+      makeDump(DUMP_REGULAR);
+  }
+}
+
+//------- SETUP & MAIN -------
+
+void setup() {
+  lcd.begin(20, 4);
+  rs485.begin(RS485_BAUD);
+  pinMode(RS485_RTS_PIN, OUTPUT);
+  setupPrint();
+  waitPrintln("{E:Electicity meter started}*");
+}
+
+void loop() {
+  updateState();
+  dumpState();
   blinkLed.blink(REGULAR_BLINK_INTERVAL);
+
 }
