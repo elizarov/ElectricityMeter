@@ -11,7 +11,7 @@
 */
 
 // include the library code:
-#include <Wire.h>
+#include <ExtendedWire.h>
 #include <Adafruit_LiquidCrystal.h>
 #include <SoftwareSerial.h>
 #include <FixNum.h>
