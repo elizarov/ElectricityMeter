@@ -31,9 +31,11 @@ const long PERIODIC_DUMP_SKEW = 5000;
 
 const unsigned int REGULAR_BLINK_INTERVAL = 1000; // 1 sec
 
-const unsigned long RS485_TIMEOUT = 100;
+const unsigned long RS485_TIMEOUT = 200;
 const unsigned long RS485_DELAY = 10;
 const unsigned long UPDATE_PERIOD = 500;
+
+const unsigned long OPEN_CHANNEL_PERIOD = 10000L; // 10 sec
 
 //------- HARDWARE ------
 
@@ -49,28 +51,24 @@ Adafruit_LiquidCrystal lcd(0);
 BlinkLed blinkLed(BLINK_LED_PIN);
 SoftwareSerial rs485(RS485_TXO_PIN, RS485_RXI_PIN);
 
+Timeout openChannelTimeout(0);
 Timeout updateTimeout(0);
 
 //------- STATE ------
 
-const char STATUS_UNKNOWN = '?';
-const char STATUS_OK = '*';
-
-const uint32_t INVALID_VALUE = 0x7fffffff;
-
-char status = STATUS_UNKNOWN;
 fixnum32_1 volts[4];
 fixnum32_1 amps[4]; 
 fixnum32_1 watts[4];
 fixnum32_1 hertz;
+uint8_t validValues;
 
 //------- LCD ------
 
 inline void updateLCDSummary() {
   //              01234567890123456789
-  char buf[21] = "?  ??.?Hz     ?????W";
-  buf[0] = status;
-  hertz.format(buf + 3, 4, FMT_RIGHT | 1);
+  char buf[21] = "[??] ??.?Hz   ?????W";
+  formatDecimal(validValues, buf + 1, 2, FMT_RIGHT | 2);
+  hertz.format(buf + 5, 4, FMT_RIGHT | 1);
   watts[0].format(buf + 14, 5, FMT_RIGHT | 0);
   lcd.setCursor(0, 0);
   lcd.print(buf);
@@ -97,9 +95,14 @@ inline void updateLCD() {
 
 uint8_t sendReceiveRaw(uint8_t* req, uint8_t req_size, uint8_t* resp, uint8_t resp_size) {
   computeCRC(req, req_size - 2);
+  // drain read buffer before making request
+  while (rs485.available())
+    rs485.read();
+  // write request  
   digitalWrite(RS485_RTS_PIN, 1); // write 
   delay(RS485_DELAY);
   rs485.write(req, req_size);
+  // read response
   digitalWrite(RS485_RTS_PIN, 0); // read
   Timeout timeout(RS485_TIMEOUT);
   uint8_t n = 0;
@@ -129,13 +132,24 @@ bool openChannel() {
   for (uint8_t i = 3; i < 9; i++)
     req[i] = 0x01; // password  
   const uint8_t resp_size = 4;
-  byte resp[resp_size];   
+  uint8_t resp[resp_size];   
   if (!sendReceive(req, req_size, resp, resp_size))
     return false;
   return resp[1] == 0x00; // Ok
 }
 
+bool checkChannel() {
+  if (openChannelTimeout.check()) {
+      if (!openChannel())
+        return false;
+      openChannelTimeout.reset(OPEN_CHANNEL_PERIOD);
+  }
+  return true;
+}
+
 int32_t readValue(uint8_t code) {
+  if (!checkChannel())
+    return 0;
   const uint8_t req_size = 6;
   uint8_t req[req_size];
   req[0] = 0x00;
@@ -145,24 +159,28 @@ int32_t readValue(uint8_t code) {
   const uint8_t resp_size = 6;
   uint8_t resp[resp_size];
   if (!sendReceive(req, req_size, resp, resp_size)) 
-    return INVALID_VALUE;
+    return 0;
   return ((uint32_t)(resp[1] & (uint8_t)0x3f) << 16) |
     ((uint32_t)resp[2]) | ((uint32_t)resp[3] << 8);  
 }
 
+template<prec_t prec,prec_t prec2> uint8_t updateValue(FixNum<int32_t,prec>& value, FixNum<int32_t,prec2> x) {
+  if (x == 0) 
+    return 0;
+  value = x;
+  return 1;
+}
+
 void updateValues() {
-  if (!openChannel()) {
-    status = STATUS_UNKNOWN;
-    return;
-  }
-  status = STATUS_OK;
+  uint8_t cnt = 0;
   for (uint8_t i = 1; i <= 3; i++)
-    volts[i] = fixnum32_2(readValue(0x10 + i));
+    cnt += updateValue(volts[i], fixnum32_2(readValue(0x10 + i)));
   for (uint8_t i = 1; i <= 3; i++)
-    amps[i] = fixnum32_3(readValue(0x20 + i));
+    cnt += updateValue(amps[i], fixnum32_3(readValue(0x20 + i)));
   for (uint8_t i = 0; i <= 3; i++)
-    watts[i] = fixnum32_2(readValue(0x00 + i));
-  hertz = fixnum32_2(readValue(0x40));  
+    cnt += updateValue(watts[i], fixnum32_2(readValue(0x00 + i)));
+  cnt += updateValue(hertz, fixnum32_2(readValue(0x40)));  
+  validValues = cnt;
 }
 
 void updateState() {
@@ -199,8 +217,6 @@ const char DUMP_REGULAR = 0;
 const char DUMP_FIRST = HIGHLIGHT_CHAR;
 
 void makeDump(char dumpType) {
-  if (status != STATUS_OK)
-    return; // no communication with meter -- do not report
   // format summary data
   wsRef = watts[0];
   fsRef = hertz;
