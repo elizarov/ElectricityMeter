@@ -21,6 +21,7 @@
 #include <Uptime.h>
 
 #include "crc.h"
+#include "parse.h"
 #include "xprint.h"
 
 //------- ALL TIME DEFS ------
@@ -54,20 +55,49 @@ SoftwareSerial rs485(RS485_TXO_PIN, RS485_RXI_PIN);
 Timeout openChannelTimeout(0);
 Timeout updateTimeout(0);
 
+Timeout okStatusTimeout;
+
 //------- STATE ------
 
 fixnum32_1 volts[4];
 fixnum32_1 amps[4]; 
 fixnum32_1 watts[4];
 fixnum32_1 hertz;
-uint8_t validValues;
+fixnum32_0 curDayEnergy;
+fixnum32_0 prevDayEnergy;
+int8_t validValues;
+
+const int8_t EXPECTED_VALUES = 13;
+
+bool okStatusBlink;
 
 //------- LCD ------
 
 inline void updateLCDSummary() {
   //              01234567890123456789
-  char buf[21] = "[??] ??.?Hz   ?????W";
-  formatDecimal(validValues, buf + 1, 2, FMT_RIGHT | 2);
+  char buf[21] = "[?]  ??.?Hz   ?????W";
+  int8_t missingValues = EXPECTED_VALUES - validValues;
+  char status;
+  if (missingValues == 0) {
+    if (!okStatusTimeout.enabled())
+      okStatusBlink = false;
+    if (!okStatusTimeout.enabled() || okStatusTimeout.check()) {
+      okStatusTimeout.reset(REGULAR_BLINK_INTERVAL);
+      okStatusBlink = !okStatusBlink;
+    }
+    status = okStatusBlink ? '*' : ' ';  
+  } else {
+    okStatusTimeout.disable(); 
+    if (missingValues < 0)
+      status = '+';
+    else if (missingValues <= 9)
+      status = '0' + missingValues;  
+    else if (validValues > 0)
+      status = '#';
+    else  
+      status = '!';
+  }
+  buf[1] = status;    
   hertz.format(buf + 5, 4, FMT_RIGHT | 1);
   watts[0].format(buf + 14, 5, FMT_RIGHT | 0);
   lcd.setCursor(0, 0);
@@ -147,9 +177,11 @@ bool checkChannel() {
   return true;
 }
 
+const int32_t INVALID_VALUE = 0x7fffffffL;
+
 int32_t readValue(uint8_t code) {
   if (!checkChannel())
-    return 0;
+    return INVALID_VALUE;
   const uint8_t req_size = 6;
   uint8_t req[req_size];
   req[0] = 0x00;
@@ -159,20 +191,46 @@ int32_t readValue(uint8_t code) {
   const uint8_t resp_size = 6;
   uint8_t resp[resp_size];
   if (!sendReceive(req, req_size, resp, resp_size)) 
-    return 0;
+    return INVALID_VALUE;
   return ((uint32_t)(resp[1] & (uint8_t)0x3f) << 16) |
     ((uint32_t)resp[2]) | ((uint32_t)resp[3] << 8);  
 }
 
+// num
+// x00 -- from reset
+// x10 -- for current year
+// x20 -- for previous year
+// x3x -- for month x
+// x40 -- for current day
+// x50 -- for prev day
+int32_t readEnergy(uint8_t num) {
+  if (!checkChannel())
+    return INVALID_VALUE;
+  const uint8_t req_size = 6;
+  uint8_t req[req_size];
+  req[0] = 0x00;
+  req[1] = 0x05; // read summaries
+  req[2] = num;  // what
+  req[3] = 0x00; /// all tariffs
+  const uint8_t resp_size = 19;
+  uint8_t resp[resp_size];
+  if (!sendReceive(req, req_size, resp, resp_size)) 
+    return INVALID_VALUE;
+  return (uint32_t)resp[3] |
+    ((uint32_t)resp[4] << 8) | 
+    ((uint32_t)resp[1] << 16) |
+    ((uint32_t)resp[2] << 24);  
+}
+
 template<prec_t prec,prec_t prec2> uint8_t updateValue(FixNum<int32_t,prec>& value, FixNum<int32_t,prec2> x) {
-  if (x == 0) 
+  if (!x.valid()) 
     return 0;
   value = x;
   return 1;
 }
 
 void updateValues() {
-  uint8_t cnt = 0;
+  int8_t cnt = 0;
   for (uint8_t i = 1; i <= 3; i++)
     cnt += updateValue(volts[i], fixnum32_2(readValue(0x10 + i)));
   for (uint8_t i = 1; i <= 3; i++)
@@ -180,6 +238,8 @@ void updateValues() {
   for (uint8_t i = 0; i <= 3; i++)
     cnt += updateValue(watts[i], fixnum32_2(readValue(0x00 + i)));
   cnt += updateValue(hertz, fixnum32_2(readValue(0x40)));  
+  cnt += updateValue(curDayEnergy, fixnum32_0(readEnergy(0x40)));
+  cnt += updateValue(prevDayEnergy, fixnum32_0(readEnergy(0x50)));
   validValues = cnt;
 }
 
@@ -198,13 +258,16 @@ const char HIGHLIGHT_CHAR = '*';
 bool firstDump = true; 
 
 Timeout dump(INITIAL_DUMP_INTERVAL);
-char dumpSLine[] = "[E:99999 f99.9;u00000000]* ";
+char dumpSLine[] = "[E:99999 f99.9;c000000 p000000 u00000000]* ";
 char dumpPLine[] = "[Ex:99999 v999 a99.9]";
 
 char* highlightPtr = FmtRef::find(dumpSLine, HIGHLIGHT_CHAR);
 
 FmtRef wsRef(dumpSLine);
 FmtRef fsRef(dumpSLine, 'f');
+
+FmtRef cRef(dumpSLine, 'c');
+FmtRef pRef(dumpSLine, 'p');
 FmtRef uRef(dumpSLine, 'u');
 
 char* phasePtr = FmtRef::find(dumpPLine, 'x');
@@ -215,11 +278,14 @@ FmtRef apRef(dumpPLine, 'a');
 
 const char DUMP_REGULAR = 0;
 const char DUMP_FIRST = HIGHLIGHT_CHAR;
+const char DUMP_QUERY = '?';
 
 void makeDump(char dumpType) {
   // format summary data
   wsRef = watts[0];
   fsRef = hertz;
+  cRef = curDayEnergy;
+  pRef = prevDayEnergy;
   uRef = uptime();
   // format terminator char
   if (dumpType == DUMP_REGULAR) {
@@ -255,6 +321,16 @@ inline void dumpState() {
   }
 }
 
+//------- EXECUTE COMMAND -------
+
+void executeCommand(char cmd) {
+  switch (cmd) {
+  case CMD_QUERY:
+    makeDump(DUMP_QUERY);
+    break;
+  }
+}
+
 //------- SETUP & MAIN -------
 
 void setup() {
@@ -269,5 +345,5 @@ void loop() {
   updateState();
   dumpState();
   blinkLed.blink(REGULAR_BLINK_INTERVAL);
-
+  executeCommand(parseCommand());
 }
